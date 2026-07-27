@@ -36,8 +36,13 @@
 
 ### 1.4 Storage / NFS
 - `nfs-common` and `rpcbind` are installed (NFS client ready)
-- **No NFS exports configured** on this Pi (`showmount -e` failed)
-- No dedicated `pi-nas` device is currently online or exporting volumes
+- **NAS device online but NFS not yet configured:** `pi-nas` at `192.168.1.109` responds to ping (0.25ms) but `showmount -e` fails with "RPC: Program not registered"
+- **Decision required:** Configure NFS server on `192.168.1.109` now, or use local bind mounts as temporary stand-in for POC
+
+| Path | Description | Trade-off |
+|------|------------|-----------|
+| **A. NFS now** | Set up `nfs-kernel-server` on 192.168.1.109, export `/var/nfs/abis/volumes/` | True production layout from day one, requires extra setup |
+| **B. Local stand-in** | Use `/var/abis/volumes/` on host SSD as temporary directory | Immediate, zero config, transparent migration to NFS later |
 
 ---
 
@@ -73,22 +78,24 @@
 
 ## 3. Persistence Strategy Recommendation
 
-### Finding: No separate NAS device is currently operational
+### Finding: NAS device exists but NFS service is not yet configured
+
+**Correction (2026-07-27):** `pi-nas` at `192.168.1.109` is online and reachable (0.25ms ping). The NFS *server* is not running — `showmount -e` fails with "RPC: Program not registered". This is a configuration gap, not a hardware gap.
 
 | Strategy | Feasibility | Persistence | Speed | Verdict |
 |----------|------------|-------------|-------|---------|
-| **Local bind mounts** (host → container) | Immediate | Survives container restart | Fast (local SSD) | **POC RECOMMENDATION** |
+| **NFS from pi-nas (192.168.1.109)** | Needs `nfs-kernel-server` setup on NAS | Network-attached, survives host reboot | Fast (local LAN) | **RECOMMENDED once configured** |
+| Local bind mounts (host → container) | Immediate | Survives container restart | Fast (local SSD) | **POC fallback** |
 | Docker named volumes | Immediate | Survives container restart | Fast | Good alternative |
-| NFS from separate Pi | Requires 2nd Pi | Network-attached | Medium | **Production target** |
 | SSHFS | Requires remote host | Network-attached | Slow | Not recommended |
 | Git-based persistence | Complex | Versioned but heavy | Slow | Overkill for POC |
 
-### POC Plan: Simulated pi-nas on same host
+### POC Plan: Local bind mounts until NFS is ready
 
-Since no separate NAS Pi is online, Phase 1 will simulate the pi-nas layout:
+While NFS server setup is pending, use local bind mounts on host SSD:
 
 ```
-/var/abis/volumes/          # On host SSD (simulates /var/nfs/abis/volumes/)
+/var/abis/volumes/          # On host SSD (temporary, mirrors eventual NFS layout)
 ├── kid-001/
 │   ├── workspace/
 │   ├── chat_history/
@@ -102,11 +109,12 @@ Each container gets a bind mount:
 docker run -v /var/abis/volumes/kid-001:/home/user ...
 ```
 
-When `pi-nas` is deployed, the same directory structure migrates to NFS:
+**Migration to NFS is transparent:** when NFS is ready on `192.168.1.109`, mount it at `/var/abis/volumes/` on the host. Containers keep the same bind mounts — no container changes needed.
+
 ```bash
-# Mount NFS on host
-mount pi-nas:/var/nfs/abis/volumes /var/abis/volumes
-# Containers keep same bind mounts — transparent migration
+# Once NFS is configured on pi-nas:
+mount -t nfs 192.168.1.109:/var/nfs/abis/volumes /var/abis/volumes
+# Containers continue working unchanged
 ```
 
 ### Phase 2 Door: Real pi-nas
@@ -135,6 +143,22 @@ mount pi-nas:/var/nfs/abis/volumes /var/abis/volumes
 3. **Standard tooling** (`curl`, browser WebSocket API, `websocat`)
 4. **Port allocation is simple** (sequential: 7584, 7585, ...)
 5. **Same protocol for Phase 2** (no migration needed when adding more features)
+
+### Why not SSE (Server-Sent Events)?
+
+SSE was considered and explicitly rejected:
+
+| Aspect | WebSocket | SSE (HTTP streaming) |
+|--------|-----------|----------------------|
+| Direction | **Bidirectional** (send + receive on same connection) | Unidirectional (server→client only) |
+| Send message | Same socket | Separate POST request |
+| State management | One connection object | Two connection objects to manage |
+| Real-time chat | Natural | Requires polling or dual connection |
+| Tool results | JSON payload back on same socket | Needs another POST/response |
+
+**Verdict:** SSE is elegant for one-way push (notifications, logs) but awkward for conversational AI where user sends messages and agent streams responses back. WebSocket is the correct abstraction for bidirectional chat.
+
+**Phase 2 door:** SSE could supplement WebSocket for admin notifications (new signup alert, safety flag) where only server→client push is needed.
 
 ### Port Allocation Plan
 ```
@@ -169,6 +193,23 @@ mount pi-nas:/var/nfs/abis/volumes /var/abis/volumes
 - Login blocked if `approved = 0`
 - Orchestrator only creates containers for `approved = 1` users
 
+### Production workflow (Phase 2)
+
+The user's refinement: admin should only see the "Approve" button after the kid's full setup is complete.
+
+```
+signup
+  → profile_complete (kid fills profile)
+    → access_restrictions_set (admin configures age-appropriate permissions)
+      → admin_sees_approve_button
+        → approved = 1
+          → container_created
+```
+
+**States:** `PENDING_PROFILE` → `PENDING_RESTRICTIONS` → `PENDING_APPROVAL` → `APPROVED` → `CONTAINER_READY`
+
+This ensures the admin never approves a kid whose permissions haven't been configured.
+
 ### Phase 2 Doors
 - Email notification to admin on new signup
 - Webhook to Slack/Discord/Mission Control
@@ -190,10 +231,37 @@ mount pi-nas:/var/nfs/abis/volumes /var/abis/volumes
 | **Total headroom** | **~3GB** | **4 cores (Pi 5 = 4 cores)** | **Host SSD** |
 
 ### Concern: CPU oversubscription
-Pi 5 has 4 cores. 8 containers × 1 core = 8 cores requested. Containers will be CPU-throttled but not crash — Linux handles oversubscription via time-slicing. For POC with 1-3 active kids simultaneously, this is fine. For 8 concurrent active kids, we need either:
-- Mac Mini M5 (Phase 2 hardware)
-- systemd-nspawn (lower overhead)
-- Docker CPU limits (`--cpus=0.5` per container)
+Pi 5 has 4 cores. 8 containers × 1 core = 8 cores requested. Containers will be CPU-throttled but not crash — Linux handles oversubscription via time-slicing. For POC with 1-3 active kids simultaneously, this is fine. For 8 concurrent active kids, response times will degrade.
+
+**Options to scale beyond 3-4 active kids on Pi 5:**
+- Docker CPU limits (`--cpus=0.5` per container) — reduces per-kid responsiveness
+- systemd-nspawn — lower overhead, ~20% more capacity
+- Mac Mini M5 — Phase 2 hardware (see below)
+
+### Phase 2 Hardware: Mac Mini M5 Capacity
+
+Why Mac Mini M5 solves the problem:
+
+| Spec | Raspberry Pi 5 | Mac Mini M5 (24GB) | Mac Mini M5 (32GB) |
+|------|---------------|---------------------|---------------------|
+| CPU | 4 × Cortex-A76 @ 2.4GHz | ~12 cores (4P+8E) @ ~4.4GHz | ~12 cores (4P+8E) @ ~4.4GHz |
+| Single-core IPC | ~1x baseline | ~3-4x faster per core (Apple Silicon) | ~3-4x faster per core |
+| RAM | 16GB LPDDR4X | 24GB unified memory | 32GB unified memory |
+| Memory bandwidth | ~34 GB/s | ~100+ GB/s | ~100+ GB/s |
+| Neural Engine | None | 16-core (38 TOPS) | 16-core (38 TOPS) |
+| Idle→load latency | Slow (load model from SD) | Fast (unified memory) | Fast |
+
+**Estimated simultaneous active ATA users:**
+
+| Hardware | Ollama RAM | Left for ATA | Per kid (512MB) | Simultaneous active |
+|----------|-----------|-------------|-----------------|-------------------|
+| Pi 5 (16GB) | ~6GB | ~10GB | 20 kids | **2-3** (CPU-bound) |
+| Mac Mini M5 (24GB) | ~8GB | ~16GB | 32 kids | **20-25** (CPU ample) |
+| Mac Mini M5 (32GB) | ~8GB | ~24GB | 48 kids | **30-40** (CPU ample) |
+
+**Key insight:** On Pi 5, RAM is not the bottleneck — CPU is. 4 weak cores cannot drive 8 concurrent LLM inference streams. On Mac Mini M5, CPU is 9-12× faster and has 3× the cores, so CPU is no longer the bottleneck. RAM becomes the limiting factor, and 24-32GB supports 20-40 active kids comfortably.
+
+**1 Mac Mini M5 (24GB) ≈ 8-10 Raspberry Pi 5s** for this workload.
 
 ---
 
@@ -216,12 +284,12 @@ Pi 5 has 4 cores. 8 containers × 1 core = 8 cores requested. Containers will be
 | # | Decision | Phase 1 (POC) | Phase 2 Door |
 |---|----------|--------------|--------------|
 | 1 | Container runtime | Docker (installed, working) | systemd-nspawn (lower overhead) |
-| 2 | Persistence | Local bind mounts on host SSD | NFS from dedicated pi-nas |
-| 3 | Communication | HTTP API + WebSocket per container | Same (no change needed) |
+| 2 | Persistence | Local bind mounts on host SSD (NFS at 192.168.1.109 not yet configured) | NFS from pi-nas (192.168.1.109) |
+| 3 | Communication | HTTP API + WebSocket per container | SSE for admin notifications (one-way push) |
 | 4 | Port range | 7584-7591 (8 containers) | Expand as needed |
-| 5 | Admin approval | Boolean flag in SQLite | Email/webhook/classroom codes |
+| 5 | Admin approval | Boolean flag in SQLite | Multi-state workflow: profile → restrictions → approval |
 | 6 | Resource limit | 512MB-1GB RAM, 5GB disk per kid | CPU throttling, quotas |
-| 7 | Max concurrent | 8 kids (CPU oversubscribed) | Mac Mini M5 scaling |
+| 7 | Max concurrent (Pi 5) | 8 enrolled, ~2-3 simultaneously active | Mac Mini M5: 20-40 simultaneously active |
 
 ---
 
