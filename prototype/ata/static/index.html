@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>ATA Prototype</title>
+</head>
+<body>
+    <h1>ATA Prototype — WebSocket Chat</h1>
+    <div id="status">Connecting...</div>
+    <div id="chat" style="border:1px solid #ccc; height:300px; overflow:auto; padding:10px; margin:10px 0;"></div>
+    <input id="msg" type="text" size="60" placeholder="Type a message...">
+    <button onclick="send()">Send</button>
+    <button onclick="connect()">Reconnect</button>
+
+<script>
+    let ws = null;
+    const chat = document.getElementById('chat');
+    const status = document.getElementById('status');
+    const input = document.getElementById('msg');
+
+    function append(text) {
+        chat.innerHTML += text.replace(/\n/g, '<br>');
+        chat.scrollTop = chat.scrollHeight;
+    }
+
+    function connect() {
+        if (ws) ws.close();
+        status.textContent = "Connecting...";
+        ws = new WebSocket("ws://" + location.host + "/ws/chat");
+        
+        ws.onopen = function() {
+            status.textContent = "Connected";
+        };
+        ws.onmessage = function(ev) {
+            const text = ev.data;
+            if (text.includes("---DONE---")) {
+                append("\n[END]\n\n");
+            } else {
+                append(text);
+            }
+        };
+        ws.onerror = function(err) {
+            status.textContent = "Error: " + err;
+        };
+        ws.onclose = function() {
+            status.textContent = "Disconnected";
+        };
+    }
+
+    function send() {
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            alert("Not connected");
+            return;
+        }
+        const text = input.value;
+        if (!text) return;
+        append("\n\nYOU: " + text + "\n\nAGENT: ");
+        ws.send(text);
+        input.value = "";
+    }
+
+    input.addEventListener("keydown", function(ev) {
+        if (ev.key === "Enter") send();
+    });
+
+    connect();
+</script>
+</body>
+</html>
