@@ -3,7 +3,7 @@
 > Ticket: #1 [map] Define system architecture for ABIS User Agents
 > Date: 2026-07-27
 > Author: Hermes (Chief of Staff)
-> Status: Architecture defined after grilling session with Matthieu
+> Status: Architecture defined after grilling session with Matthieu. Updated v2.1 (2026-07-27): Docker for POC (systemd-nspawn debootstrap failed), ports shifted to 788x, NAS at 192.168.1.109 confirmed online.
 
 ---
 
@@ -48,7 +48,7 @@ The container is a **progressive environment**: it starts as a friendly chat tut
 │  │                                                                     │   │
 │  │  ┌─────────────────────────────────────────────────────────────┐   │   │
 │  │  │                 ABIS API (Flask/FastAPI)                     │   │   │
-│  │  │  Port: 7582 (or similar, not conflicting)                    │   │   │
+│  │  │  Port: 7882 (external-facing HTTP + WebSocket)              │   │   │
 │  │  │  Responsibilities:                                         │   │   │
 │  │  │  - Auth (signup, login, JWT)                               │   │   │
 │  │  │  - Admin approval endpoints                                │   │   │
@@ -60,7 +60,7 @@ The container is a **progressive environment**: it starts as a friendly chat tut
 │  │                              ▼                                      │   │
 │  │  ┌─────────────────────────────────────────────────────────────┐   │   │
 │  │  │              ORCHESTRATOR SERVICE (Python daemon)          │   │   │
-│  │  │  Port: 7583 (localhost only)                               │   │   │
+│  │  │  Port: 7883 (localhost only — internal)                     │   │   │
 │  │  │  Responsibilities:                                         │   │   │
 │  │  │  - Safety scanning (keyword check on ALL traffic)          │   │   │
 │  │  │  - Forward chat messages to appropriate container          │   │   │
@@ -144,7 +144,7 @@ The container is a **progressive environment**: it starts as a friendly chat tut
 - **Real-time:** WebSocket connection from browser to pi-agent API (via Cloudflare Tunnel or direct IP)
 
 ### 3.2 ABIS API (pi-agent, Flask/FastAPI)
-- **Port:** 7582
+- **Port:** 7882
 - **Responsibilities:**
   - HTTP: signup, login, JWT validation, admin endpoints
   - WebSocket: proxy student chat to container's ATA agent
@@ -153,7 +153,7 @@ The container is a **progressive environment**: it starts as a friendly chat tut
 - **No state:** All state lives in orchestrator SQLite or pi-nas
 
 ### 3.3 Orchestrator Service (pi-agent, Python daemon)
-- **Port:** 7583 (localhost only, not exposed externally)
+- **Port:** 7883 (localhost only, not exposed externally)
 - **Responsibilities:**
   - **Safety scanning:** Keyword-based scan on ALL messages (kid → agent AND agent → kid). Logs flagged conversations for admin review.
   - **Traffic forwarding:** Route WebSocket messages to correct container
@@ -165,7 +165,7 @@ The container is a **progressive environment**: it starts as a friendly chat tut
 
 ### 3.4 ATA Agent (inside each container)
 - **Technology:** FastAPI + WebSocket server (Python, ~200-500 lines)
-- **Port:** 7584 (inside container, forwarded from host)
+- **Port:** 7884 (inside container, forwarded from host)
 - **DNA from Hermes:**
   - Same Ollama client code (OpenAI-compatible Python client)
   - Same tool execution logic (subprocess, file read/write)
@@ -205,33 +205,38 @@ Each kid gets a persistent directory on pi-nas, bind-mounted into their containe
 └── .openclaw/               # For Phase 2 (if kid unlocks OpenClaw)
 ```
 
-### 3.6 Container Technology: systemd-nspawn
-**Why systemd-nspawn over Docker/LXC:**
+### 3.6 Container Technology: Docker (POC)
+**Why Docker for POC:**
 
-| Criteria | systemd-nspawn | Docker | LXC |
-|----------|---------------|--------|-----|
-| Overhead | Minimal — no daemon | Medium — dockerd | Low — lxd |
-| Boot time | Fast (seconds) | Medium (tens of sec) | Fast |
-| Native on Pi | Yes (systemd built-in) | Needs install | Needs install |
-| Rootless | Yes (`--private-users`) | Complex | Yes |
-| Bind mount | Trivial (`--bind`) | Volume mgmt | Medium |
-| Resource limits | Native cgroups (systemd) | Docker handles | lxc handles |
-| Portability to Mac | **No** (Linux only) | **Yes** (Docker Desktop) | **No** |
+| Criteria | Docker | systemd-nspawn | LXC |
+|----------|--------|---------------|-----|
+| Installed on Pi | **Yes** (29.5.3) | No (package available) | No |
+| Working today | **Yes** (hello-world tested) | No (debootstrap failed) | No |
+| Overhead | Medium (~50-100MB per container) | Minimal (~10MB) | Low |
+| Boot time | Medium (tens of seconds) | Fast (seconds) | Fast |
+| Image ecosystem | **Excellent** (Docker Hub ARM64) | Manual debootstrap | Manual |
+| Resource limits | Docker handles | Native cgroups (systemd) | lxc handles |
+| Portability to Mac | **Yes** (Docker Desktop) | No (Linux only) | No |
 
-**Critical finding:** systemd-nspawn is Linux-only. When we migrate to Mac Mini M5s, we MUST switch to Docker or Podman. **This is a Phase 2 migration.** For POC on Pi: systemd-nspawn is fine.
+**Critical finding:** systemd-nspawn was the initial choice but debootstrap failed to create a working Debian rootfs (`tar extraction error` during package unpacking). Docker is the only working container runtime on pi-agent today. systemd-nspawn is a **Phase 2 door** — installable but requires debugging before use.
 
 **Container creation (POC):**
 ```bash
-sudo systemd-nspawn \
-  -D /var/abis/containers/kid-001 \
-  --private-users=pick \
-  --bind=/var/nfs/abis/volumes/kid-001:/home/kid \
-  --bind=/var/abis/permissions/kid-001.json:/etc/ata/permissions.json:ro \
-  --property=MemoryLimit=1G \
-  --property=CPUQuota=25% \
-  --network-veth \
-  --boot
+# Build base image
+docker build -t abis-ata-base .
+
+# Run container for kid-001
+docker run -d \
+  --name kid-001 \
+  --memory=1g \
+  --cpus=1.0 \
+  -p 7884:7884 \
+  -v /var/abis/volumes/kid-001:/home/user \
+  -v /var/abis/permissions/kid-001.json:/etc/ata/permissions.json:ro \
+  abis-ata-base
 ```
+
+**Phase 2 migration:** systemd-nspawn or Docker on Mac Mini (latest Apple Silicon).
 
 ### 3.7 Permission Gating
 Each container has a read-only permissions file (bind-mounted from host). The ATA agent checks this before executing any tool:
@@ -275,19 +280,19 @@ Kid's Browser (Cloudflare Pages)
 Cloudflare Tunnel (or direct IP to pi-agent)
   │
   ▼
-ABIS API (pi-agent:7582)
+ABIS API (pi-agent:7882)
   │
   │ 1. Validate JWT token
   │ 2. Identify kid-001
   │ 3. Forward message to orchestrator
   ▼
-Orchestrator Service (pi-agent:7583)
+Orchestrator Service (pi-agent:7883)
   │
   │ 1. Safety scan message (keyword check)
   │ 2. If flagged: log alert, notify admin, optionally block
   │ 3. Forward to kid-001's container
   ▼
-Container kid-001 (systemd-nspawn)
+Container kid-001 (Docker)
   │
   │ ATA Agent receives message
   │ Loads conversation history from NAS volume
@@ -331,33 +336,35 @@ Kid's Browser
 | 11434 | Ollama | pi-agent | Native Ollama API |
 | 11435 | LiteLLM | pi-agent | Model proxy + tracing |
 | 18789 | OpenClaw Gateway | pi-agent | Optional bridge for advanced users |
-| 7582 | ABIS API | pi-agent | External-facing HTTP + WebSocket |
-| 7583 | Orchestrator | pi-agent | Localhost only — internal |
-| 7584+ | ATA Agents | containers | Dynamic per container (7584, 7585, ...) |
+| 7882 | ABIS API | pi-agent | External-facing HTTP + WebSocket |
+| 7883 | Orchestrator | pi-agent | Localhost only — internal |
+| 7884+ | ATA Agents | containers | Dynamic per container (7884, 7885, ...) |
 | 2049 | NFS | pi-nas | NFS server for user volumes |
 
-**Container ports are dynamic.** The orchestrator assigns a unique host port to each container's ATA agent (starting at 7584). The ABIS API knows which port maps to which kid.
+**Container ports are dynamic.** The orchestrator assigns a unique host port to each container's ATA agent (starting at 7884). The ABIS API knows which port maps to which kid.
 
 ---
 
 ## 6. Security Boundaries
 
 ### 6.1 User Isolation
-- Each container: `--private-users` (UID mapping from host to container)
-- Host files owned by root; container sees them as owned by kid's UID
-- No root access inside container (drops to unprivileged user after boot)
-- Containers cannot see each other's volumes (separate bind mounts)
+- Each container runs in its own Docker network and user namespace (default Docker behavior)
+- Host files owned by host user (`matthieu` or `root`); container sees them as owned by container's internal UID
+- Containers run as unprivileged user inside (not root)
+- Containers cannot see each other's volumes (separate bind mounts with unique source directories)
+- Docker daemon runs as root on host, but containers are sandboxed via Linux namespaces and cgroups
 
 ### 6.2 Resource Limits (per container)
-- **Memory:** 1GB (`--property=MemoryLimit=1G`)
-- **CPU:** 25% (`--property=CPUQuota=25%`)
+- **Memory:** 1GB (`--memory=1g` in Docker)
+- **CPU:** 1 core (`--cpus=1.0` in Docker, or `--cpus=0.5` to allow oversubscription)
 - **Disk:** 5GB quota on pi-nas (enforced via NAS quotas or separate partitions)
 
 ### 6.3 Network Isolation
-- `--network-veth` gives each container virtual ethernet
-- No bridge between containers (iptables DROP between veth interfaces)
-- Containers can reach Ollama (11434/11435) on host
-- Containers CANNOT reach other containers or the internet directly
+- Each container gets its own Docker network namespace (bridge or isolated)
+- No direct network between containers (separate `--network` assignments or iptables rules)
+- Containers can reach Ollama (11434/11435) on host via `--add-host=host.docker.internal:host-gateway`
+- Containers CANNOT reach other containers or the internet directly (controlled via Docker network policies or firewall rules)
+- Docker daemon manages port forwarding (`-p 7884:7884`) from host to container
 
 ### 6.4 Data Privacy
 - User volumes on pi-nas encrypted at rest (optional: LUKS per volume)
@@ -400,7 +407,7 @@ Kid's Browser
 ```
 POST /containers
   Body: {"user_id": "kid-001", "template": "ata-base"}
-  Response: {"container_id": "kid-001", "status": "creating", "host_port": 7584}
+  Response: {"container_id": "kid-001", "status": "creating", "host_port": 7884}
 
 GET /containers/:id
   Response: {"id": "kid-001", "status": "running|stopped|paused",
@@ -440,7 +447,7 @@ GET /admin/users/:id/conversations
 
 ### Phase 0: POC (Now — 1-2 months)
 - **pi-agent:** Raspberry Pi 5, 16GB RAM, SSD boot
-- **pi-nas:** Raspberry Pi (any model), USB HDD/SSD, NFS server
+- **pi-nas:** Raspberry Pi (any model), **8GB RAM**, USB HDD/SSD, NFS server
 - **Max users:** 8 concurrent (8 × 1GB = 8GB RAM + 3GB host = 11GB / 16GB)
 - **Test users:** You + 13yo kid + 11yo nephew
 
@@ -450,8 +457,8 @@ GET /admin/users/:id/conversations
 - **Add:** OAuth login, classroom codes, teacher dashboards
 
 ### Phase 2: Scale (Future — 6-12 months)
-- **Hardware upgrade:** 2x Mac Mini M5 (or equivalent) with 32-64GB RAM each
-- **Container migration:** systemd-nspawn → Docker/Podman (Linux VMs on Mac or cloud)
+- **Hardware upgrade:** 2x Mac Mini (latest Apple Silicon, e.g. M4/M5) with 32-64GB RAM each
+- **Container migration:** Docker on Mac (Linux VMs or cloud instances)
 - **Max users:** 100+ (load balanced across hosts)
 - **Add:** Multi-school support, billing tiers, advanced monitoring
 
@@ -469,7 +476,7 @@ GET /admin/users/:id/conversations
 | Safety scanning on all traffic | Orchestrator keyword scan on every message in both directions |
 | Progressive capabilities | Permission JSON file controls available tools per user |
 | Auto-pause inactive containers | Orchestrator 7-day timeout + manual admin pause |
-| Resource limits per container | systemd cgroups: 1GB RAM, 25% CPU, 5GB disk |
+| Resource limits per container | Docker: 1GB RAM, 1 core, 5GB disk |
 | Lightweight on Pi 5 | 8 containers × 1GB = 8GB. Total ~11GB/16GB. Within budget. |
 
 ---
@@ -495,7 +502,7 @@ GET /admin/users/:id/conversations
 - OpenClaw bridge inside container
 - Code execution / web search / browser automation
 - Image generation / cron jobs
-- Docker/Podman migration for Mac Mini M5s
+- Docker on latest Apple Silicon Mac Mini
 - Multi-school support
 - Billing and quotas
 - Real-time collaboration (multiple kids on same project)
@@ -514,7 +521,7 @@ GET /admin/users/:id/conversations
 | No safety scanning | **Orchestrator-level keyword scanning** mandatory from day 1 | Child safety is non-negotiable |
 | No permission system | **Permission-gated tool execution** via read-only JSON | Admin controls what each kid can do |
 | Always running or immediate stop | **Always running + auto-pause after 7 days + manual pause** | Feels persistent but manages resources |
-| No mention of future scaling | **Mac Mini M5 roadmap** with Docker migration | systemd-nspawn is Linux-only |
+| No mention of future scaling | **Mac Mini roadmap** with Docker migration | systemd-nspawn is Linux-only, Docker for POC |
 
 ---
 
